@@ -16,11 +16,17 @@ from pssh.clients import ParallelSSHClient
 from io import StringIO
 import json
 import subprocess
+import sys
+
+def get_nodes():
+    nodes = json.loads(subprocess.check_output(['sinfo','--json']).decode("utf8"))["nodes"]
+    node_list = []
+    for n in nodes:
+        node_list.append(n["name"])
+    return node_list
 
 def compute_power_per_node():
-    m = 465
-    #m = 3
-    hosts = ["gpu-st-p4d-24xlarge-"+str(i) for i in range(1,m)]
+    hosts = get_nodes()
     client = ParallelSSHClient(hosts, timeout=10, pool_size=500)
 
     output = list(client.run_command('bash -c "for i in {1..5} ; do nvidia-smi --query-gpu=index,power.draw  --format=csv,nounits ; echo  ; sleep 1; done"', stop_on_errors=False))
@@ -48,7 +54,7 @@ def compute_power_per_node():
     return node_gpu_to_power_usage
 
 def expand_nodes(s):
-        s = s.replace("gpu-st-p4d-24xlarge-", "").replace("[","").replace("]","")
+        s = s.replace("ip-", "").replace("[","").replace("]","")
         ns = list(s.split(","))
         nodes = []
         for n in ns:
@@ -60,7 +66,7 @@ def expand_nodes(s):
                 nodes.extend(list(range(b,e+1)))
             else:
                 nodes.append(int(n))
-        return ["gpu-st-p4d-24xlarge-"+str(n) for n in nodes]
+        return ["ip-"+str(n) for n in nodes]
 
 # looks like gpu:a100:8(IDX:0-7)
 def parse_gpu(gpu):
@@ -75,7 +81,6 @@ def parse_gpu(gpu):
         else:
             g = [int(g)]
         fgpus.extend(g)
-
     return fgpus
 
 def backtick(msg):
@@ -98,22 +103,22 @@ def get_msg():
     sums = []
     gpu_counts = []
     for gpus,nodes,job_resources,user_name in zip(df["gres_detail"], df["nodes"], df['job_resources'], df['user_name']):
-       if 'allocated_nodes' in job_resources:
-          allocated_nodes = list(job_resources['allocated_nodes'].values())
+       if hasattr(job_resources, '__iter__') and 'allocated_nodes' in job_resources:
+          allocated_nodes = job_resources['allocated_nodes']
        else:
           allocated_nodes = []
        fnodes = expand_nodes(nodes)
        power_usage = 0
        gpu_count = 0
-       for i, node in enumerate(fnodes):
-          allocated_node=allocated_nodes[i]
+       for i, allocated_node in enumerate(allocated_nodes):
+          node=allocated_node['nodename']
           gpu = gpus[i] if i < len(gpus) else None
-          cpus_used = allocated_node['cpus']
+          cpus_used = allocated_node['cpus_used']
           if gpu is None:
               gpu = list(range(int(cpus_used/6)))
           else:
               gpu = parse_gpu(gpu)
-          gpu_count += len(gpu) 
+          gpu_count += len(gpu)
           for g in gpu:
               power_usage += node_gpu_to_power_usage[node+":"+str(g)] if node+":"+str(g) in node_gpu_to_power_usage else 0
        sums.append(power_usage)
@@ -148,7 +153,7 @@ def get_msg():
         g = g.sort_values("gpu_count")
         return str(g)
 
-    df = df[df["partition"] == "gpu"]
+    df = df[df["partition"].str.startswith("g")]
     running = df[df["job_state"] == "RUNNING"]
     pending = df[df["job_state"] == "PENDING"]
     preemptible = running[running["account"].isin(preemptible_accounts)]
@@ -172,10 +177,11 @@ def get_msg():
     group3 += f"Non pre emptible count: {non_preemptible_count} gpus\n"
 
     msg = backtick(group1)+backtick(group2)+backtick(group3)
-    return msg
+    groups = [group1,group2,group3]
+    return msg,groups
 
 
-discord = False
+discord = True
 
 if discord:
     import discord
@@ -194,27 +200,34 @@ if discord:
         print(get_msg())
         sys.exit(1)                   # might as well just stop here
 
+class UsageBotClient(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    # Initialize bot client object
-    client = discord.Client()
+        # an attribute we can access from our task
+        self.counter = 0
 
+    async def setup_hook(self) -> None:
+        # start the task to run in the background
+        print("starting background task")
+        self.my_background_task.start()
 
-    # Setup background task 
+    async def on_ready(self):
+        return
+
     @tasks.loop(hours=12)
-    async def my_background_task():
-        """A background task that gets invoked every __ hours."""
-        channel = client.get_channel(channel_id) 
-        await channel.send(get_msg())
-        
+    async def my_background_task(self):
+        channel = self.get_channel(channel_id)  # channel ID goes here
+        print(f"sending message to {channel_id}")
+        msg, groups = get_msg()
+        for m in groups:
+          await channel.send(backtick(m))
+
     @my_background_task.before_loop
-    async def my_background_task_before_loop():
-        await client.wait_until_ready()
+    async def before_my_task(self):
+        await self.wait_until_ready()  # wait until the bot logs in
 
-    my_background_task.start()
-
-
-    # Run the bot
-    client.run(token)
-else:
-    msg = get_msg()
-    print(msg)
+# Initialize bot client object
+client = UsageBotClient(intents=discord.Intents.default())
+# Run the bot
+client.run(token)
